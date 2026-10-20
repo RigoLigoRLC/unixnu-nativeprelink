@@ -1,5 +1,7 @@
 # NativePrelink
 
-Kernel prelink emitter and tooling.
+Kernel prelink tooling. Reads a Mach-O kernel and emits the prelinked image and boot metadata.
 
-Maintained as an independent module and included by [UniXNU](https://github.com/UniXNU/UniXNU) at `kits/NativePrelink`.
+Current state: used by the kernel build and the sheng payload step.
+
+Run by `unixnu build kernel` and `unixnu build payload`.
