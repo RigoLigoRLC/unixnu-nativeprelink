@@ -5,9 +5,11 @@ import base64
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import xml.etree.ElementTree as ET
+import uuid
 
 from native_prelink import backed_offset, exports, macho, plan, unserialize_xml
 
@@ -114,9 +116,19 @@ def instruction_inventory(original_data, parent, modules):
             'register_dataflow_qualified': False}
 
 
-def emit(native_data, original_data, roots, slide, early_security_init=None):
+def emit(native_data, original_data, roots, slide, early_security_init=None, storage_bindings=None):
+    record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
     report = plan(native_data, original_data, roots, slide)
     native, original = macho(native_data), macho(original_data)
+    native_exports = {name: address for address, names in exports(native_data, native).items() for name in names}
+    for bindings in storage_bindings or []:
+        extents = [entry for entry in report['extents'] if entry['module'] == bindings['module']]
+        if bindings['prelink_slide'] != slide or extents != bindings['module_extents']:
+            raise ValueError('Storage import addresses require rebinding for the selected module layout')
+        for name, value in bindings['bindings'].items():
+            if native_exports.get(name) != int(value, 0):
+                raise ValueError('Linked storage import does not match its module layout: ' + name)
+    report['storage_binding_inputs'] = storage_bindings or []
     marker = [address for address, names in exports(native_data, native).items()
               if '_kalloc_sparse_prelink_index_version' in names]
     if len(marker) != 1:
@@ -133,7 +145,10 @@ def emit(native_data, original_data, roots, slide, early_security_init=None):
     for identifier in report['components']:
         va = entries[identifier]['_PrelinkExecutableLoadAddr']
         modules[identifier] = macho(original_data, backed_offset(parent, va, 32, len(original_data)))
-    report.update(instruction_inventory(original_data, parent, modules))
+    if record_hashes:
+        report.update(instruction_inventory(original_data, parent, modules))
+    else:
+        report['instruction_inventory_performed'] = False
     early_security_init = early_security_init or {}
     if early_security_init:
         markers = [address for address, names in exports(native_data, native).items()
@@ -266,7 +281,8 @@ def emit(native_data, original_data, roots, slide, early_security_init=None):
         raise ValueError('Rebased KASLR offset cannot fit original 32-bit format')
     new_metadata = {'_PrelinkInfoDictionary': selected_entries,
                     '_PrelinkLinkKASLROffsets': struct.pack(f'<{len(offsets) + 1}I', len(offsets), *offsets),
-                    '_PrelinkKCID': hashlib.sha256(native_data + original_data).digest()[:16]}
+                    '_PrelinkKCID': hashlib.sha256(native_data + original_data).digest()[:16]
+                    if record_hashes else uuid.uuid4().bytes}
     xml = ET.tostring(to_xml(new_metadata), encoding='utf-8').replace(b' />', b'/>') + b'\0'
     info_va = align(max(s['va'] + s['size'] for s in native['segments'] if s['size']))
     append_segment('__PRELINK_INFO', info_va, xml, align(len(xml)), 3)
@@ -298,11 +314,14 @@ def emit(native_data, original_data, roots, slide, early_security_init=None):
                 new = new_offset(segment['va'] + slide, segment['filesize'])
                 if output[new:new + segment['filesize']] != original_data[old:old + segment['filesize']]:
                     raise ValueError('Original executable bytes changed')
-                text_hashes[identifier] = hashlib.sha256(original_data[old:old + segment['filesize']]).hexdigest()
+                if record_hashes:
+                    text_hashes[identifier] = hashlib.sha256(original_data[old:old + segment['filesize']]).hexdigest()
     macho(output)
-    report.update(candidate_sha256=hashlib.sha256(output).hexdigest(), coalesced_segments=new_segments,
-                  original_executable_sha256=text_hashes, candidate_bytes=len(output),
+    report.update(coalesced_segments=new_segments, candidate_bytes=len(output),
                   source_inputs_modified=False, runtime_qualified=False, loadable=False)
+    if record_hashes:
+        report.update(candidate_sha256=hashlib.sha256(output).hexdigest(),
+                      original_executable_sha256=text_hashes)
     return bytes(output), report
 
 
@@ -313,6 +332,8 @@ def main():
     parser.add_argument('--root', required=True, action='append')
     parser.add_argument('--slide', required=True, type=lambda value: int(value, 0))
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--storage-bindings', action='append', type=Path, default=[],
+                        help='Binding record whose module addresses must match this prelink output')
     parser.add_argument('--early-security-init', action='append', default=[], metavar='BUNDLE=ORIGINAL_VA',
                         help='Explicit original void(void) policy initializer, called before lockdown; requires source ABI')
     args = parser.parse_args()
@@ -322,7 +343,8 @@ def main():
         if not separator or not identifier or identifier in initializers:
             parser.error('Use one BUNDLE=ORIGINAL_VA initializer per module')
         initializers[identifier] = int(address, 0)
-    image, report = emit(args.kernel.read_bytes(), args.prelinked.read_bytes(), args.root, args.slide, initializers)
+    bindings = [json.loads(path.read_text()) for path in args.storage_bindings]
+    image, report = emit(args.kernel.read_bytes(), args.prelinked.read_bytes(), args.root, args.slide, initializers, bindings)
     if args.output.exists():
         raise SystemExit('Refuse to overwrite an existing candidate')
     args.output.parent.mkdir(parents=True, exist_ok=True)

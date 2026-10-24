@@ -5,6 +5,7 @@ import base64
 from bisect import bisect_right
 from collections import Counter
 import hashlib
+import os
 import json
 from pathlib import Path
 import struct
@@ -237,13 +238,15 @@ def plan(native_data, original_data, roots, slide):
                 raise ValueError(f'Rebased component collides with native {s["name"]}')
         extents.append({'module': identifier, 'segment': segment['name'],
                         'va': start + slide, 'size': end - start})
-    return {'native_sha256': hashlib.sha256(native_data).hexdigest(),
-            'original_sha256': hashlib.sha256(original_data).hexdigest(),
-            'slide': slide, 'components': sorted(selected - codeless),
+    report = {'slide': slide, 'components': sorted(selected - codeless),
             'codeless_components': sorted(codeless), 'kernel_interfaces': sorted(interfaces),
             'pointer_counts': dict(Counter(binding['kind'] for binding in bindings)),
             'extents': extents, 'bindings': bindings, 'images_modified': False,
             'instruction_relocation_complete': False, 'abi_qualified': False, 'loadable': False}
+    if os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0':
+        report.update(native_sha256=hashlib.sha256(native_data).hexdigest(),
+                      original_sha256=hashlib.sha256(original_data).hexdigest())
+    return report
 
 
 def main():
